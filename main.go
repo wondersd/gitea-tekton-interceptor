@@ -31,6 +31,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"hash"
+	"strings"
+
+	"golang.org/x/oauth2"
 	
 	"google.golang.org/grpc/codes"
 	"go.uber.org/zap"
@@ -42,6 +45,8 @@ import (
 	triggersv1 "github.com/tektoncd/triggers/pkg/apis/triggers/v1beta1"
 	corev1lister "k8s.io/client-go/listers/core/v1"
 	"github.com/tektoncd/triggers/pkg/interceptors"
+	gitea "code.gitea.io/sdk/gitea"
+	kubeclient "knative.dev/pkg/client/injection/kube/client"
 )
 
 const (
@@ -53,6 +58,7 @@ const (
 )
 
 func main() {
+	
 	// set up signals so we handle the first shutdown signal gracefully
 	ctx := signals.NewContext()
 
@@ -76,7 +82,8 @@ func main() {
 	}()
 
 	secretLister := secretInformer.Get(ctx).Lister()
-	service := NewGiteaInterceptor(secretLister, logger)
+	service := NewGiteaInterceptor(secretLister, logger, interceptors.DefaultSecretGetter(kubeclient.Get(ctx).CoreV1()))
+
 	startInformer()
 
 	mux := http.NewServeMux()
@@ -153,6 +160,10 @@ func internal(err error) HTTPError {
 	return HTTPError{Code: http.StatusInternalServerError, Err: err}
 }
 
+const (
+	changedFilesExtensionsKey            = "changed_files"
+)
+
 func (gi *GiteaInterceptor) executeInterceptor(r *http.Request) ([]byte, error) {
 	// Create a context
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
@@ -180,15 +191,42 @@ func (gi *GiteaInterceptor) executeInterceptor(r *http.Request) ([]byte, error) 
 // ErrInvalidContentType is returned when the content-type is not a JSON body.
 var ErrInvalidContentType = errors.New("form parameter encoding not supported, please change the hook to send JSON payloads")
 
+const pullRequest = "pull_request"
+
+var acceptedEventTypes = []string{pullRequest, "push"}
+
+type payloadDetails struct {
+	PrNumber     int64
+	Owner        string
+	Repository   string
+	ChangedFiles string
+}
+
 type GiteaInterceptor struct {
 	SecretLister corev1lister.SecretLister
 	Logger       *zap.SugaredLogger
+	SecretGetter interceptors.SecretGetter
 }
 
-func NewGiteaInterceptor(s corev1lister.SecretLister, l *zap.SugaredLogger) *GiteaInterceptor {
+// InterceptorParams provides a webhook to intercept and pre-process events
+type InterceptorParams struct {
+	SecretRef *triggersv1.SecretRef `json:"secretRef,omitempty"`
+	// +listType=atomic
+	EventTypes      []string        `json:"eventTypes,omitempty"`
+	GiteaURL        string          `json:"giteaUrl,omitempty"`
+	AddChangedFiles AddChangedFiles `json:"addChangedFiles,omitempty"`
+}
+
+type AddChangedFiles struct {
+	Enabled             bool                  `json:"enabled,omitempty"`
+	PersonalAccessToken *triggersv1.SecretRef `json:"personalAccessToken,omitempty"`
+}
+
+func NewGiteaInterceptor(s corev1lister.SecretLister, l *zap.SugaredLogger, sg interceptors.SecretGetter) *GiteaInterceptor {
 	return &GiteaInterceptor{
 		SecretLister: s,
 		Logger:       l,
+		SecretGetter: sg,
 	}
 }
 
@@ -198,14 +236,15 @@ func (w *GiteaInterceptor) Process(ctx context.Context, r *triggersv1.Intercepto
 		return interceptors.Fail(codes.InvalidArgument, ErrInvalidContentType.Error())
 	}
 
-	p := triggersv1.GitHubInterceptor{}
+	p := InterceptorParams{}
 	if err := interceptors.UnmarshalParams(r.InterceptorParams, &p); err != nil {
 		return interceptors.Failf(codes.InvalidArgument, "failed to parse interceptor params: %v", err)
 	}
 
+	actualEvent := headers.Get("X-Gitea-Event")
+
 	// Check if the event type is in the allow-list
 	if p.EventTypes != nil {
-		actualEvent := headers.Get("X-Gitea-Event")
 		isAllowed := false
 		for _, allowedEvent := range p.EventTypes {
 			if actualEvent == allowedEvent {
@@ -239,6 +278,59 @@ func (w *GiteaInterceptor) Process(ctx context.Context, r *triggersv1.Intercepto
 		if err := validateSignature(header, []byte(r.Body), secretToken); err != nil {
 			return interceptors.Fail(codes.FailedPrecondition, err.Error())
 		}
+	}
+
+	if p.AddChangedFiles.Enabled {
+		shouldAddChangedFiles := false
+		for _, allowedEvent := range acceptedEventTypes {
+			if actualEvent == allowedEvent {
+				shouldAddChangedFiles = true
+				break
+			}
+		}
+		if !shouldAddChangedFiles {
+			return &triggersv1.InterceptorResponse{
+				Continue: true,
+			}
+		}
+
+		if r.Context == nil {
+			return interceptors.Failf(codes.InvalidArgument, "no request context passed")
+		}
+
+		secretToken, err := w.getGithubTokenSecret(ctx, r, p)
+		if err != nil {
+			return interceptors.Failf(codes.FailedPrecondition, "error getting secret: %v", err)
+		}
+
+		w.Logger.Infof("Secret Token is: %+v", secretToken)
+
+		payload, err := parseBodyForChangedFiles(r.Body, actualEvent)
+		if err != nil {
+			return interceptors.Failf(codes.FailedPrecondition, "error parsing body: %v", err)
+		}
+
+		w.Logger.Infof("Payload is: %+v", payload)
+
+		w.Logger.Infof("gitUrl is: %+v", p.GiteaURL)
+
+		var changedFiles string
+		if actualEvent == "pull_request" {
+			changedFiles, err = getChangedFilesFromPr(ctx, payload, p.GiteaURL, secretToken)
+			if err != nil {
+				return interceptors.Failf(codes.FailedPrecondition, "error getting changed files: %v", err)
+			}
+		} else {
+			changedFiles = payload.ChangedFiles
+		}
+
+		return &triggersv1.InterceptorResponse{
+			Extensions: map[string]interface{}{
+				changedFilesExtensionsKey: changedFiles,
+			},
+			Continue: true,
+		}
+
 	}
 
 	return &triggersv1.InterceptorResponse{
@@ -292,4 +384,142 @@ func validateSignature(signature string, payload, secretToken []byte) error {
 		return errors.New("payload signature check failed")
 	}
 	return nil
+}
+
+func (w *GiteaInterceptor) getGithubTokenSecret(ctx context.Context, r *triggersv1.InterceptorRequest, p InterceptorParams) (string, error) {
+	if p.AddChangedFiles.PersonalAccessToken == nil {
+		return "", nil
+	}
+	if p.AddChangedFiles.PersonalAccessToken.SecretKey == "" {
+		return "", errors.New("github interceptor githubToken.secretKey is empty")
+	}
+	ns, _ := triggersv1.ParseTriggerID(r.Context.TriggerID)
+	secretToken, err := w.SecretGetter.Get(ctx, ns, p.AddChangedFiles.PersonalAccessToken)
+	if err != nil {
+		return "", err
+	}
+	return string(secretToken), nil
+}
+
+func parseBodyForChangedFiles(body string, eventType string) (payloadDetails, error) {
+	results := payloadDetails{}
+	if body == "" {
+		return results, fmt.Errorf("body is empty")
+	}
+
+	var jsonMap map[string]interface{}
+	err := json.Unmarshal([]byte(body), &jsonMap)
+	if err != nil {
+		return results, err
+	}
+
+	var prNum int64
+	_, ok := jsonMap["number"]
+	if ok {
+		prNum = int64(jsonMap["number"].(float64))
+	} else {
+		if eventType == "pull_request" {
+			return results, fmt.Errorf("pull_request body missing 'number' field")
+		}
+		prNum = -1
+	}
+
+	repoSection, ok := jsonMap["repository"].(map[string]interface{})
+	if !ok {
+		return results, fmt.Errorf("payload body missing 'repository' field")
+	}
+
+	fullName, ok := repoSection["full_name"].(string)
+	if !ok {
+		return results, fmt.Errorf("payload body missing 'repository.full_name' field")
+	}
+
+	changedFiles := []string{}
+
+	commitsSection, ok := jsonMap["commits"].([]interface{})
+	if ok {
+
+		for _, commit := range commitsSection {
+			addedFiles, ok := commit.(map[string]interface{})["added"].([]interface{})
+			if !ok {
+				return results, fmt.Errorf("payload body missing 'commits.*.added' field")
+			}
+
+			modifiedFiles, ok := commit.(map[string]interface{})["modified"].([]interface{})
+			if !ok {
+				return results, fmt.Errorf("payload body missing 'commits.*.modified' field")
+			}
+
+			removedFiles, ok := commit.(map[string]interface{})["removed"].([]interface{})
+			if !ok {
+				return results, fmt.Errorf("payload body missing 'commits.*.removed' field")
+			}
+			for _, fileName := range addedFiles {
+				changedFiles = append(changedFiles, fmt.Sprintf("%v", fileName))
+			}
+
+			for _, fileName := range modifiedFiles {
+				changedFiles = append(changedFiles, fmt.Sprintf("%v", fileName))
+			}
+
+			for _, fileName := range removedFiles {
+				changedFiles = append(changedFiles, fmt.Sprintf("%v", fileName))
+			}
+		}
+	}
+
+	results = payloadDetails{
+		PrNumber:     prNum,
+		Owner:        strings.Split(fullName, "/")[0],
+		Repository:   strings.Split(fullName, "/")[1],
+		ChangedFiles: strings.Join(changedFiles, ","),
+	}
+	return results, nil
+}
+
+func getChangedFilesFromPr(ctx context.Context, payload payloadDetails, url string, token string) (string, error) {
+
+	changedFiles := []string{}
+
+	client, err := makeClient(ctx, url, token)
+	if err != nil {
+		return "", err
+	}
+
+	opt := gitea.ListPullRequestFilesOptions{}
+	for {
+
+		files, resp, err := client.ListPullRequestFiles(payload.Owner, payload.Repository, payload.PrNumber, opt)
+		if err != nil {
+			return "", err
+		}
+		for _, file := range files {
+			changedFiles = append(changedFiles, file.Filename)
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+
+	return strings.Join(changedFiles, ","), nil
+}
+
+func makeClient(ctx context.Context, url string, token string) (*gitea.Client, error) {
+
+	var httpClient *http.Client
+	var client *gitea.Client
+
+	if token != "" {
+		tokenSource := oauth2.StaticTokenSource(
+			&oauth2.Token{AccessToken: token},
+		)
+		httpClient = oauth2.NewClient(ctx, tokenSource)
+	} else {
+		return nil, errors.New("no token, unable to create http client")
+	}
+
+	client = gitea.NewClientWithHTTP(url, httpClient)
+	return client, nil
 }

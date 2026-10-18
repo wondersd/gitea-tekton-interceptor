@@ -9,9 +9,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM scratch
-ARG BUILT_ARTIFACT
-ADD "$BUILT_ARTIFACT" /
+FROM golang:1.27.2-alpine3.23@sha256:9e45f0eb4a63ed37ad6e604950407558b7c738e34e015ae77a5d4ad369cde079 as builder
+
+RUN apk add git
+
+RUN mkdir /gitea-tekton-interceptor
+
+WORKDIR /gitea-tekton-interceptor
+
+VOLUME /go
+
+COPY go.mod .
+COPY go.sum .
+
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go mod download
+
+COPY main.go .
+
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go mod tidy
+
+RUN cat go.sum
+RUN cat go.mod
+
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go build
+
+FROM alpine:3.23.6@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
+
+COPY --from=builder /gitea-tekton-interceptor/giteainterceptor /
+
 EXPOSE 8080
 ENTRYPOINT [ "/giteainterceptor" ]
 CMD [ ]
